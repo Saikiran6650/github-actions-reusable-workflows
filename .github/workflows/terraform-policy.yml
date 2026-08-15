@@ -79,7 +79,7 @@ jobs:
           ref: ${{ inputs.policy_ref }}
           path: policies
 
-      - uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@v4
         with:
           terraform_version: ${{ inputs.terraform_version }}
           terraform_wrapper: false
