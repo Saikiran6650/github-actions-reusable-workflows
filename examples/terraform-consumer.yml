@@ -1,0 +1,81 @@
+# Example: a Terraform repository with dev and prod environments.
+#
+# Copy into .github/workflows/ and adjust `working_directories` and the image or module
+# paths. This is the shape terraform-aws-network-foundation and
+# terraform-aws-three-tier-app both use.
+
+name: Terraform
+
+on:
+  pull_request:
+    paths: ["environments/**", "modules/**", ".github/workflows/terraform.yml"]
+  push:
+    branches: [main]
+    paths: ["environments/**", "modules/**", ".github/workflows/terraform.yml"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Deliberately false. Cancelling a run that is mid-apply leaves state locked and
+  # infrastructure half-changed.
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    uses: Saikiran6650/github-actions-reusable-workflows/.github/workflows/terraform-validate.yml@v1
+    with:
+      working_directories: '["environments/dev", "environments/prod"]'
+
+  security:
+    uses: Saikiran6650/github-actions-reusable-workflows/.github/workflows/security-scan.yml@v1
+    permissions:
+      contents: read
+      security-events: write
+    with:
+      frameworks: terraform
+
+  plan:
+    needs: [validate, security]
+    if: github.event_name == 'pull_request'
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: [dev, prod]
+    uses: Saikiran6650/github-actions-reusable-workflows/.github/workflows/terraform-plan.yml@v1
+    permissions:
+      contents: read
+      id-token: write # request the OIDC token
+      pull-requests: write # post the plan comment
+    with:
+      environment: ${{ matrix.environment }}
+      working_directory: environments/${{ matrix.environment }}
+      role_arn: ${{ vars.AWS_PLAN_ROLE_ARN }}
+
+  apply-dev:
+    needs: [validate, security]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    uses: Saikiran6650/github-actions-reusable-workflows/.github/workflows/terraform-apply.yml@v1
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      environment: dev
+      working_directory: environments/dev
+      role_arn: ${{ vars.AWS_APPLY_ROLE_ARN }}
+
+  apply-prod:
+    # Sequential, not parallel. A change that breaks dev must not reach prod in the
+    # same run.
+    needs: [apply-dev]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    uses: Saikiran6650/github-actions-reusable-workflows/.github/workflows/terraform-apply.yml@v1
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      # The required-reviewer rule on this GitHub Environment is the promotion gate.
+      environment: prod
+      working_directory: environments/prod
+      role_arn: ${{ vars.AWS_APPLY_ROLE_ARN }}

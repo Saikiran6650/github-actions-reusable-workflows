@@ -1,0 +1,270 @@
+name: Container build
+
+# Build, scan, smoke test, then publish — in that order.
+#
+# The order is the design. An image that has not been scanned and has not been proven to
+# start is not published, so a broken or vulnerable image never acquires a tag that
+# something downstream might deploy.
+#
+# Pull requests build and scan but never push. A fork's pull request must not be able to
+# publish an artifact into the registry, and `if: github.event_name == 'push'` on the login
+# and push steps is what prevents it.
+
+on:
+  workflow_call:
+    inputs:
+      image_name:
+        description: "Image name without a registry, e.g. saikiran6650/sample-service."
+        type: string
+        required: true
+      registry:
+        type: string
+        required: false
+        default: "ghcr.io"
+      dockerfile:
+        type: string
+        required: false
+        default: "Dockerfile"
+      context:
+        type: string
+        required: false
+        default: "."
+      platforms:
+        description: "Target platforms. Multi-arch lets the same tag run on Graviton and x86 nodes."
+        type: string
+        required: false
+        default: "linux/amd64,linux/arm64"
+      push:
+        description: "Publish the image. Ignored on pull requests, which never push."
+        type: boolean
+        required: false
+        default: true
+      severity:
+        description: "Trivy severities that fail the build."
+        type: string
+        required: false
+        default: "HIGH,CRITICAL"
+      ignore_unfixed:
+        description: >-
+          Do not fail on vulnerabilities with no available fix. They are still reported to
+          the Security tab. Failing on them trains everyone to ignore the gate, because
+          the only remedy is to wait for an upstream release.
+        type: boolean
+        required: false
+        default: true
+      smoke_test_port:
+        type: number
+        required: false
+        default: 8080
+      smoke_test_path:
+        description: "Path polled after starting the container. Empty disables the smoke test."
+        type: string
+        required: false
+        default: "/readyz"
+      expected_uid:
+        description: >-
+          UID the container must run as. -1 disables the check. Asserting this at runtime
+          catches a Dockerfile change that drops the USER instruction, which no static
+          scan reliably reports.
+        type: number
+        required: false
+        default: -1
+    outputs:
+      image_digest:
+        description: "Digest of the published image. Deploy by this, not by tag."
+        value: ${{ jobs.build.outputs.digest }}
+      image_tags:
+        description: "Tags applied to the published image."
+        value: ${{ jobs.build.outputs.tags }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write # publish to GHCR
+      security-events: write # upload SARIF
+      id-token: write # keyless signing
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+      tags: ${{ steps.meta.outputs.tags }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+        # Needed to build arm64 on an amd64 runner.
+        if: contains(inputs.platforms, 'arm64')
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Derive build metadata
+        id: build_meta
+        run: |
+          echo "git_sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "build_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=0.0.0-$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Compute tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ inputs.registry }}/${{ inputs.image_name }}
+          tags: |
+            type=sha,format=short,prefix=
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+          # No `latest`. A mutable tag makes the running revision unknowable from a
+          # manifest, which turns a rollback into a guess.
+
+      # Single-platform local build first, because a multi-arch build cannot be loaded into
+      # the local daemon and therefore cannot be scanned or started here.
+      - name: Build for scanning
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          load: true
+          push: false
+          tags: scan-target:ci
+          build-args: |
+            VERSION=${{ steps.build_meta.outputs.version }}
+            GIT_SHA=${{ steps.build_meta.outputs.git_sha }}
+            BUILD_TIME=${{ steps.build_meta.outputs.build_time }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Trivy image scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: scan-target:ci
+          format: sarif
+          output: trivy-image.sarif
+          severity: ${{ inputs.severity }}
+          ignore-unfixed: ${{ inputs.ignore_unfixed }}
+          exit-code: "1"
+
+      - name: Upload Trivy SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: success() || failure() # upload findings even when the gate failed
+        with:
+          sarif_file: trivy-image.sarif
+          category: trivy-image
+
+      - name: Smoke test the image
+        if: inputs.smoke_test_path != ''
+        run: |
+          set -euo pipefail
+
+          # Started with the same constraints the Kubernetes securityContext will apply,
+          # so a violation surfaces here rather than as a CrashLoopBackOff in a cluster.
+          docker run -d --name smoke \
+            -p ${{ inputs.smoke_test_port }}:${{ inputs.smoke_test_port }} \
+            --read-only --tmpfs /tmp --cap-drop=ALL \
+            --security-opt no-new-privileges \
+            scan-target:ci
+
+          ok=false
+          for _ in $(seq 1 30); do
+            if curl -fsS "localhost:${{ inputs.smoke_test_port }}${{ inputs.smoke_test_path }}" >/dev/null 2>&1; then
+              ok=true; break
+            fi
+            sleep 2
+          done
+
+          if [ "$ok" != true ]; then
+            echo "::error::container did not become ready"
+            docker logs smoke
+            exit 1
+          fi
+
+          if [ "${{ inputs.expected_uid }}" -ge 0 ]; then
+            uid=$(docker exec smoke id -u)
+            if [ "$uid" != "${{ inputs.expected_uid }}" ]; then
+              echo "::error::expected uid ${{ inputs.expected_uid }}, got $uid"
+              exit 1
+            fi
+            echo "::notice::container runs as uid $uid"
+          fi
+
+          docker rm -f smoke
+
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          image: scan-target:ci
+          format: cyclonedx-json
+          output-file: sbom.json
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ steps.build_meta.outputs.git_sha }}
+          path: sbom.json
+          retention-days: 90
+
+      # --- publish ---------------------------------------------------------
+      # Everything below is gated on a push event. A pull request, including one from a
+      # fork, reaches this point having built and scanned but never publishes.
+
+      - name: Log in to the registry
+        if: inputs.push && github.event_name == 'push'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ inputs.registry }}
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Build and push
+        id: push
+        if: inputs.push && github.event_name == 'push'
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          push: true
+          platforms: ${{ inputs.platforms }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ steps.build_meta.outputs.version }}
+            GIT_SHA=${{ steps.build_meta.outputs.git_sha }}
+            BUILD_TIME=${{ steps.build_meta.outputs.build_time }}
+          cache-from: type=gha
+          provenance: true # SLSA provenance attestation
+          sbom: true
+
+      - name: Install cosign
+        if: inputs.push && github.event_name == 'push'
+        uses: sigstore/cosign-installer@v3
+
+      # Keyless signing: the signing identity is the workflow's OIDC token, recorded in the
+      # public Rekor transparency log. No private key exists to store, rotate or leak.
+      # Admission control can later require a signature from this exact workflow identity.
+      - name: Sign the image
+        if: inputs.push && github.event_name == 'push'
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          cosign sign --yes \
+            "${{ inputs.registry }}/${{ inputs.image_name }}@${DIGEST}"
+
+      - name: Record the digest
+        if: inputs.push && github.event_name == 'push'
+        run: |
+          {
+            echo "### Published image"
+            echo ""
+            echo "Digest: \`${{ steps.push.outputs.digest }}\`"
+            echo ""
+            echo "Deploy by digest, not by tag."
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,105 @@
+name: Terraform validate
+
+# Static checks only. No cloud credentials, no backend, no cost.
+#
+# This runs first in every consumer pipeline because it is the fastest way to reject a
+# broken change, and because a plan job that assumes an AWS role should not be started
+# for a change that does not even format correctly.
+
+on:
+  workflow_call:
+    inputs:
+      terraform_version:
+        description: "Terraform version to install."
+        type: string
+        required: false
+        default: "1.9.8"
+      working_directories:
+        description: >-
+          JSON array of directories to init and validate, e.g.
+          '["modules/vpc", "environments/dev"]'. Each is validated with -backend=false
+          so no credentials are needed.
+        type: string
+        required: true
+      check_format:
+        description: "Run terraform fmt -check across the whole repository."
+        type: boolean
+        required: false
+        default: true
+      run_tflint:
+        description: "Run tflint. Requires a .tflint.hcl at the repository root."
+        type: boolean
+        required: false
+        default: true
+      tflint_version:
+        description: "tflint version."
+        type: string
+        required: false
+        default: "v0.53.0"
+
+permissions:
+  contents: read
+
+jobs:
+  format:
+    name: Format
+    if: inputs.check_format
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+          terraform_wrapper: false
+
+      # -diff so the log shows what is wrong, rather than only that something is.
+      - name: terraform fmt
+        run: terraform fmt -recursive -check -diff
+
+  validate:
+    name: Validate ${{ matrix.directory }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false # report every broken directory in one run, not one per push
+      matrix:
+        directory: ${{ fromJSON(inputs.working_directories) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+          terraform_wrapper: false
+
+      # -backend=false keeps this offline and credential-free. It still downloads
+      # providers, so it catches a bad provider constraint or a missing required argument.
+      - name: terraform init
+        run: terraform -chdir=${{ matrix.directory }} init -backend=false -input=false
+
+      - name: terraform validate
+        run: terraform -chdir=${{ matrix.directory }} validate -no-color
+
+  tflint:
+    name: Lint
+    if: inputs.run_tflint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: ${{ inputs.tflint_version }}
+
+      # --init downloads the ruleset plugins declared in .tflint.hcl. It needs a token
+      # only to avoid the unauthenticated GitHub API rate limit, not for any private access.
+      - name: tflint --init
+        run: tflint --init
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: tflint
+        run: tflint --recursive --format compact

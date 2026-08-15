@@ -1,0 +1,209 @@
+name: Terraform plan
+
+# Plans against real AWS using a READ-ONLY role obtained through OIDC, and posts the diff
+# as a pull request comment so a reviewer sees the consequences before approving.
+#
+# Two things this workflow will not do, deliberately:
+#
+#   1. It never accepts an AWS access key. The only credential input is a role ARN, which
+#      is useless without a matching OIDC trust policy in the target account.
+#   2. It never runs apply. Plan and apply are separate workflows with separate roles so
+#      that "can propose a change" and "can make a change" are different permissions.
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: "Environment name. Used for the state key, the role session name and the comment header."
+        type: string
+        required: true
+      working_directory:
+        description: "Directory containing the root module to plan."
+        type: string
+        required: true
+      aws_region:
+        description: "AWS region."
+        type: string
+        required: false
+        default: "us-east-1"
+      role_arn:
+        description: >-
+          IAM role to assume for planning. Should be read-only plus state access.
+          Not a secret: an ARN is inert without a matching OIDC trust.
+        type: string
+        required: true
+      terraform_version:
+        type: string
+        required: false
+        default: "1.9.8"
+      comment_on_pr:
+        description: "Post the plan as a pull request comment."
+        type: boolean
+        required: false
+        default: true
+      fail_on_changes:
+        description: >-
+          Fail the job when the plan is non-empty. Off for normal pull requests, where a
+          diff is the point. On for drift detection, where a diff means reality moved.
+        type: boolean
+        required: false
+        default: false
+    outputs:
+      has_changes:
+        description: "true when the plan contains changes."
+        value: ${{ jobs.plan.outputs.has_changes }}
+      plan_summary:
+        description: "One-line change summary, e.g. 'Plan: 3 to add, 1 to change, 0 to destroy.'"
+        value: ${{ jobs.plan.outputs.summary }}
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    name: Plan (${{ inputs.environment }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write # required to request the OIDC token
+      pull-requests: write # required to post the comment
+    outputs:
+      has_changes: ${{ steps.plan.outputs.has_changes }}
+      summary: ${{ steps.summarise.outputs.summary }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+          terraform_wrapper: false
+
+      - name: Assume plan role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ inputs.role_arn }}
+          aws-region: ${{ inputs.aws_region }}
+          # The session name appears in CloudTrail. Including the run id makes an API call
+          # traceable back to the exact workflow run that made it.
+          role-session-name: gha-plan-${{ inputs.environment }}-${{ github.run_id }}
+
+      - name: terraform init
+        run: terraform -chdir=${{ inputs.working_directory }} init -input=false -lock-timeout=5m
+
+      - name: terraform validate
+        run: terraform -chdir=${{ inputs.working_directory }} validate -no-color
+
+      - name: terraform plan
+        id: plan
+        run: |
+          set +e
+          terraform -chdir=${{ inputs.working_directory }} plan \
+            -input=false -no-color -lock-timeout=5m \
+            -detailed-exitcode -out=tfplan
+          code=$?
+          set -e
+
+          # -detailed-exitcode: 0 = no changes, 1 = error, 2 = changes present.
+          # Without it, "plan succeeded" and "plan succeeded with changes" are the same
+          # exit code and drift detection is impossible.
+          case $code in
+            0) echo "has_changes=false" >> "$GITHUB_OUTPUT" ;;
+            2) echo "has_changes=true"  >> "$GITHUB_OUTPUT" ;;
+            *) echo "has_changes=error" >> "$GITHUB_OUTPUT"; exit 1 ;;
+          esac
+
+      - name: Render plan
+        id: render
+        run: |
+          cd ${{ inputs.working_directory }}
+          terraform show -no-color tfplan > plan.txt
+
+          # GitHub rejects comments over 65536 characters. Truncate rather than fail, and
+          # say so in the comment so nobody assumes they saw the whole diff.
+          if [ "$(wc -c < plan.txt)" -gt 60000 ]; then
+            head -c 60000 plan.txt > plan.trunc.txt
+            printf '\n\n... plan truncated. Download the full plan from the run artifacts.\n' >> plan.trunc.txt
+          else
+            cp plan.txt plan.trunc.txt
+          fi
+
+          {
+            echo 'body<<PLANEOF'
+            cat plan.trunc.txt
+            echo 'PLANEOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Summarise
+        id: summarise
+        run: |
+          summary=$(grep -E '^(Plan:|No changes\.|Apply complete)' \
+            "${{ inputs.working_directory }}/plan.txt" | head -1 || echo "Plan produced no summary line.")
+          echo "summary=$summary" >> "$GITHUB_OUTPUT"
+          echo "$summary" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Comment on pull request
+        if: inputs.comment_on_pr && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        env:
+          PLAN_BODY: ${{ steps.render.outputs.body }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          SUMMARY: ${{ steps.summarise.outputs.summary }}
+        with:
+          script: |
+            // The plan is passed through env rather than interpolated into the script.
+            // Interpolating untrusted-ish text directly into JS is how a resource name
+            // containing a backtick or ${ breaks the script — or worse.
+            const marker = `<!-- tf-plan:${process.env.ENVIRONMENT} -->`;
+            const body = [
+              marker,
+              `### Terraform plan — \`${process.env.ENVIRONMENT}\``,
+              '',
+              `**${process.env.SUMMARY}**`,
+              '',
+              '<details><summary>Show plan</summary>',
+              '',
+              '```terraform',
+              process.env.PLAN_BODY,
+              '```',
+              '',
+              '</details>',
+            ].join('\n');
+
+            // Update the existing comment instead of adding one per push. A pull request
+            // with fifteen stale plan comments is a pull request nobody reads.
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                comment_id: existing.id, body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: context.issue.number, body,
+              });
+            }
+
+      # Retained so a reviewer can read the untruncated plan, and so an apply can be run
+      # against exactly what was reviewed rather than a fresh plan against moved state.
+      - name: Upload plan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ inputs.environment }}
+          path: |
+            ${{ inputs.working_directory }}/tfplan
+            ${{ inputs.working_directory }}/plan.txt
+          retention-days: 5
+
+      - name: Fail on changes
+        if: inputs.fail_on_changes && steps.plan.outputs.has_changes == 'true'
+        run: |
+          echo "::error::Plan is non-empty and fail_on_changes is set."
+          exit 1

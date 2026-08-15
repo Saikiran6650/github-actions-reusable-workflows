@@ -1,0 +1,30 @@
+version: 2
+
+updates:
+  # Actions are referenced by version tag in this repository, and tags are mutable: the
+  # owner of an action can move v4 to point at different code at any time. The stronger
+  # posture is to pin every `uses:` to a full commit SHA.
+  #
+  # Dependabot is what makes SHA pinning survivable — it raises a pull request when a new
+  # release appears and rewrites the SHA, so pinning does not mean going stale. Without it,
+  # pinned SHAs rot and people start ignoring the updates.
+  #
+  # See docs/security.md for the migration plan and why this repository has not pinned yet.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - github-actions
+    commit-message:
+      prefix: "chore(actions)"
+    groups:
+      # One pull request for routine patch and minor bumps instead of five. Major versions
+      # stay separate because they can change the interface and warrant real review.
+      routine-action-updates:
+        update-types:
+          - minor
+          - patch

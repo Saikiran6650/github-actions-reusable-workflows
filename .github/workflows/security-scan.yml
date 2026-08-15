@@ -1,0 +1,155 @@
+name: Security scan
+
+# Language-agnostic scanning: infrastructure misconfiguration and secrets.
+#
+# Everything reports SARIF into the Security tab so findings appear next to the code and
+# accumulate a history, rather than living in a job log that is garbage-collected.
+#
+# Which gates block, and why:
+#
+#   gitleaks     always blocks. A committed secret must be rotated, and the sooner someone
+#                is forced to notice, the smaller the exposure window.
+#   Checkov      blocks by default. Its findings on Terraform are usually actionable.
+#   Trivy config blocks by default, same reasoning.
+#
+# A gate that cannot be actioned by the repository it runs in should be soft — otherwise
+# people learn to ignore red, which is worse than not having the gate.
+
+on:
+  workflow_call:
+    inputs:
+      scan_directory:
+        type: string
+        required: false
+        default: "."
+      run_checkov:
+        type: boolean
+        required: false
+        default: true
+      run_trivy_config:
+        type: boolean
+        required: false
+        default: true
+      run_gitleaks:
+        type: boolean
+        required: false
+        default: true
+      frameworks:
+        description: "Checkov frameworks, comma-separated: terraform, kubernetes, dockerfile, github_actions."
+        type: string
+        required: false
+        default: "terraform"
+      soft_fail:
+        description: "Report findings without failing the build. For adopting scanning on an existing repository without blocking every pull request on day one."
+        type: boolean
+        required: false
+        default: false
+      skip_checks:
+        description: "Comma-separated Checkov check ids to skip. Every entry should be justified in the repository's docs/security.md."
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  checkov:
+    name: Checkov
+    if: inputs.run_checkov
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Checkov is invoked directly rather than through bridgecrewio/checkov-action.
+      #
+      # That action is only published on a branch (`@master`), so referencing it means
+      # running whatever landed upstream minutes ago with this job's token and secrets.
+      # Installing the tool from PyPI removes a third-party action from the supply chain
+      # and makes the version an explicit, reviewable choice.
+      #
+      # Deliberately unpinned: a scanner's value is its rule set, and pinning it means
+      # running last year's rules against this year's code. The blast radius is a CI job
+      # with read-only permissions, which is a different risk calculation from an action
+      # that can read secrets.
+      - name: Install Checkov
+        run: pip install --upgrade checkov
+
+      - name: Checkov
+        run: |
+          set -euo pipefail
+          args=(
+            --directory "${{ inputs.scan_directory }}"
+            --framework ${{ inputs.frameworks }}
+            --output cli --output sarif --output-file-path console,checkov.sarif
+            --compact
+          )
+          if [[ -n "${{ inputs.skip_checks }}" ]]; then
+            args+=(--skip-check "${{ inputs.skip_checks }}")
+          fi
+          if [[ "${{ inputs.soft_fail }}" == "true" ]]; then
+            args+=(--soft-fail)
+          fi
+          checkov "${args[@]}"
+
+      - name: Upload Checkov SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: success() || failure()
+        with:
+          sarif_file: checkov.sarif
+          category: checkov
+
+  trivy_config:
+    name: Trivy misconfiguration
+    if: inputs.run_trivy_config
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # Trivy and Checkov overlap but do not agree. Running both is cheap and each
+      # regularly finds something the other misses.
+      - name: Trivy config scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: config
+          scan-ref: ${{ inputs.scan_directory }}
+          format: sarif
+          output: trivy-config.sarif
+          severity: HIGH,CRITICAL
+          exit-code: ${{ inputs.soft_fail && '0' || '1' }}
+
+      - name: Upload Trivy SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: success() || failure()
+        with:
+          sarif_file: trivy-config.sarif
+          category: trivy-config
+
+  gitleaks:
+    name: Secret scan
+    if: inputs.run_gitleaks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history. A secret committed and then removed in a later commit is still
+          # in the history and still compromised; scanning only the tip would miss it.
+          fetch-depth: 0
+
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ github.token }}

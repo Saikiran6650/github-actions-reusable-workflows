@@ -1,0 +1,153 @@
+name: CI
+
+# This repository's own CI.
+#
+# A workflow library that is not itself linted is a library that ships broken YAML to every
+# consumer at once. actionlint catches expression errors, invalid contexts and shellcheck
+# problems inside `run:` blocks — the failures that would otherwise only appear when a
+# downstream repository calls the workflow.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  actionlint:
+    name: Lint workflows
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: actionlint
+        uses: raven-actions/actionlint@v2
+        with:
+          # shellcheck runs against every `run:` block. Most real bugs in a workflow are
+          # in the shell, not the YAML.
+          shellcheck: true
+          pyflakes: true
+          fail-on-error: true
+
+  yaml:
+    name: YAML syntax
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parse every workflow and action
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import sys, glob, yaml
+
+          failures = []
+          for path in sorted(glob.glob('.github/workflows/*.yml') + glob.glob('actions/*/action.yml')):
+              try:
+                  yaml.safe_load(open(path))
+                  print(f"ok   {path}")
+              except yaml.YAMLError as exc:
+                  failures.append(f"{path}: {exc}")
+
+          if failures:
+              print("\n".join(failures), file=sys.stderr)
+              sys.exit(1)
+          PY
+
+  contract:
+    name: Reusable workflow contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      # Guards the properties that make this library safe to depend on. Each of these has
+      # a specific failure it prevents, and none of them is caught by actionlint.
+      - name: Check invariants
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import glob, sys, yaml
+
+          failures = []
+
+          for path in sorted(glob.glob('.github/workflows/*.yml')):
+              doc = yaml.safe_load(open(path))
+              # PyYAML parses the bare key `on` as the boolean True (YAML 1.1).
+              triggers = doc.get('on', doc.get(True, {})) or {}
+              name = path.split('/')[-1]
+
+              if name == 'ci.yml':
+                  continue
+
+              if 'workflow_call' not in triggers:
+                  failures.append(f"{name}: not callable — every workflow here except ci.yml must expose workflow_call")
+                  continue
+
+              # A reusable workflow must not take long-lived cloud credentials. Roles are
+              # passed as inputs and authenticated by OIDC; a `secrets:` block accepting an
+              # access key would let a consumer opt back into static credentials.
+              call = triggers['workflow_call'] or {}
+              for secret in (call.get('secrets') or {}):
+                  if any(t in secret.lower() for t in ('aws_access', 'aws_secret', 'access_key')):
+                      failures.append(f"{name}: accepts a static AWS credential ({secret}); use OIDC")
+
+              # Top-level permissions must be declared and read-only, so a job that forgets
+              # to narrow them does not inherit write access to the whole repository.
+              perms = doc.get('permissions')
+              if perms != {'contents': 'read'}:
+                  failures.append(f"{name}: top-level permissions must be exactly {{contents: read}}, got {perms}")
+
+              # Every job needs a timeout. Without one the default is six hours, and a hung
+              # job burns runner minutes until someone notices.
+              for job_name, job in (doc.get('jobs') or {}).items():
+                  if 'timeout-minutes' not in job:
+                      failures.append(f"{name}: job '{job_name}' has no timeout-minutes")
+
+          if failures:
+              print("Contract violations:\n  " + "\n  ".join(failures), file=sys.stderr)
+              sys.exit(1)
+          print("all reusable workflows satisfy the contract")
+          PY
+
+  supply-chain:
+    name: Action supply chain
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Blocks on two things: an action from a publisher nobody reviewed, and any action
+      # pinned to a BRANCH — which runs whatever landed upstream minutes ago with this
+      # job's token.
+      #
+      # Reports, but does not yet block on, actions pinned to a mutable version tag. Add
+      # --require-sha here after running scripts/pin_actions.sh; the ordering is deliberate
+      # and explained in docs/security.md.
+      - name: Audit action references
+        run: python3 scripts/check_action_pins.py .github/workflows
+
+  security:
+    name: Security scan
+    uses: ./.github/workflows/security-scan.yml
+    permissions:
+      contents: read
+      security-events: write
+    with:
+      run_checkov: true
+      run_trivy_config: false # no infrastructure code in this repository
+      frameworks: github_actions
+      soft_fail: false

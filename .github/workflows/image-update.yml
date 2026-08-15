@@ -1,0 +1,226 @@
+name: Image update
+
+# Writes a newly published image digest into the GitOps repository.
+#
+# This is the bridge between "an image exists" and "a cluster runs it". Without it, someone
+# copies a digest by hand, and the thing running in dev is whatever the last person
+# remembered to paste.
+#
+# WHY A DIGEST AND NOT A TAG
+#
+# A tag is mutable. `:main` today and `:main` tomorrow can be different images, so a manifest
+# referencing a tag does not describe what is running — which makes both "what is deployed?"
+# and "roll back to what?" unanswerable. A digest is content-addressed: it cannot change, and
+# reverting the commit that changed it restores exactly the image that was running before.
+#
+# WHY DEV IS AUTOMATED AND PROD IS NOT
+#
+# This workflow only ever writes to the dev overlay. Promotion to prod is a human opening a
+# pull request that copies the digest already running in dev. That is not ceremony: it is the
+# only point at which someone decides that a build which passed its tests is also a build
+# they want serving customers.
+
+on:
+  workflow_call:
+    inputs:
+      gitops_repository:
+        description: "owner/repo holding the Kustomize overlays."
+        type: string
+        required: true
+      overlay_path:
+        description: "Path to the overlay whose image digest should be updated."
+        type: string
+        required: true
+      image_name:
+        description: "Image name as it appears in the kustomization `images:` block."
+        type: string
+        required: true
+      digest:
+        description: "Digest to write, including the sha256: prefix."
+        type: string
+        required: true
+      version:
+        description: "Human-readable version, used in the commit message only."
+        type: string
+        required: false
+        default: ""
+      mode:
+        description: >-
+          "commit" pushes directly to the default branch — appropriate for dev, where the
+          point is that it happens without anyone acting.
+          "pull-request" opens a PR — appropriate for any environment where a human should
+          look first.
+        type: string
+        required: false
+        default: "commit"
+      branch:
+        type: string
+        required: false
+        default: "main"
+    secrets:
+      gitops_token:
+        description: >-
+          Token with contents:write on the GitOps repository.
+
+          GITHUB_TOKEN cannot be used: it is scoped to the repository running the workflow,
+          and this writes to a different one. Use a fine-grained PAT limited to that single
+          repository, or a GitHub App installation token — an App is better because its
+          token is short-lived and its permissions are visible in the installation rather
+          than in someone's account.
+        required: true
+    outputs:
+      updated:
+        description: "true when the digest changed, false when it already matched."
+        value: ${{ jobs.update.outputs.updated }}
+
+permissions:
+  contents: read
+
+jobs:
+  update:
+    name: Update ${{ inputs.overlay_path }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      updated: ${{ steps.write.outputs.updated }}
+    steps:
+      - name: Validate the digest
+        run: |
+          set -euo pipefail
+          # A tag reaching this input would defeat the entire immutability argument, so it
+          # is rejected rather than accepted and silently written.
+          if [[ ! "${{ inputs.digest }}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::digest must be sha256: followed by 64 hex characters, got '${{ inputs.digest }}'"
+            exit 1
+          fi
+
+      - name: Checkout the GitOps repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.gitops_repository }}
+          token: ${{ secrets.gitops_token }}
+          ref: ${{ inputs.branch }}
+          # Full history so a rebase is possible if another run pushed meanwhile.
+          fetch-depth: 0
+
+      - name: Write the digest
+        id: write
+        env:
+          OVERLAY: ${{ inputs.overlay_path }}
+          IMAGE: ${{ inputs.image_name }}
+          DIGEST: ${{ inputs.digest }}
+        run: |
+          set -euo pipefail
+          file="${OVERLAY}/kustomization.yaml"
+
+          if [[ ! -f "$file" ]]; then
+            echo "::error::$file not found in ${{ inputs.gitops_repository }}"
+            exit 1
+          fi
+
+          # Edited with a YAML parser rather than sed. A regex over YAML eventually matches
+          # the wrong line — a comment, a similarly-named image — and the failure is a
+          # deployment of the wrong thing.
+          python3 - <<'PY'
+          import os, sys, yaml
+
+          path = f"{os.environ['OVERLAY']}/kustomization.yaml"
+          image_name = os.environ['IMAGE']
+          digest = os.environ['DIGEST']
+
+          with open(path) as fh:
+              doc = yaml.safe_load(fh)
+
+          images = doc.get('images') or []
+          entry = next((i for i in images if i.get('name') == image_name), None)
+          if entry is None:
+              print(f"::error::no images entry named {image_name} in {path}")
+              sys.exit(1)
+
+          previous = entry.get('digest')
+          if previous == digest:
+              print(f"digest already {digest}; nothing to do")
+              with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+                  out.write("updated=false\n")
+              sys.exit(0)
+
+          # newTag and digest are mutually exclusive in kustomize. If a tag is present it is
+          # removed, so a half-migrated overlay converges on digest pinning.
+          entry.pop('newTag', None)
+          entry['digest'] = digest
+
+          with open(path, 'w') as fh:
+              yaml.safe_dump(doc, fh, sort_keys=False, default_flow_style=False)
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write("updated=true\n")
+              out.write(f"previous={previous}\n")
+          print(f"{previous} -> {digest}")
+          PY
+
+      - name: Commit
+        if: steps.write.outputs.updated == 'true' && inputs.mode == 'commit'
+        env:
+          DIGEST: ${{ inputs.digest }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add "${{ inputs.overlay_path }}/kustomization.yaml"
+          git commit -m "chore(${{ inputs.overlay_path }}): update image to ${VERSION:-$DIGEST}
+
+          Digest: ${DIGEST}
+          Source: ${{ github.repository }}@${{ github.sha }}
+          Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          # Another run may have pushed while this one was working. Rebase and retry rather
+          # than force-push, which would discard someone else's promotion.
+          for attempt in 1 2 3; do
+            if git push origin "${{ inputs.branch }}"; then
+              echo "pushed on attempt $attempt"
+              exit 0
+            fi
+            echo "push rejected, rebasing (attempt $attempt)"
+            git pull --rebase origin "${{ inputs.branch }}"
+          done
+
+          echo "::error::could not push after 3 attempts"
+          exit 1
+
+      - name: Open a pull request
+        if: steps.write.outputs.updated == 'true' && inputs.mode == 'pull-request'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ secrets.gitops_token }}
+          branch: image-update/${{ inputs.overlay_path }}
+          delete-branch: true
+          title: "chore: promote ${{ inputs.image_name }} to ${{ inputs.overlay_path }}"
+          commit-message: |
+            chore(${{ inputs.overlay_path }}): update image digest
+
+            Digest: ${{ inputs.digest }}
+          body: |
+            Promotes `${{ inputs.image_name }}` in `${{ inputs.overlay_path }}`.
+
+            | | |
+            |---|---|
+            | Previous | `${{ steps.write.outputs.previous }}` |
+            | New | `${{ inputs.digest }}` |
+            | Version | `${{ inputs.version }}` |
+            | Built by | ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} |
+
+            Merging this changes what runs. Rolling back is `git revert` of the merge commit —
+            the previous digest is immutable, so the revert restores exactly what was running.
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Image update"
+            echo ""
+            echo "- Overlay: \`${{ inputs.overlay_path }}\`"
+            echo "- Digest: \`${{ inputs.digest }}\`"
+            echo "- Changed: \`${{ steps.write.outputs.updated }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

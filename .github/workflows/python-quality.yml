@@ -1,0 +1,147 @@
+name: Python quality
+
+# Lint, type check and test. Ordered cheapest-first so a formatting mistake fails in
+# thirty seconds rather than after a full matrix of test runs.
+
+on:
+  workflow_call:
+    inputs:
+      python_versions:
+        description: >-
+          JSON array of versions to test against, e.g. '["3.11", "3.12"]'.
+          Test the declared floor as well as the shipped version — otherwise the floor is
+          a claim rather than a fact.
+        type: string
+        required: false
+        default: '["3.12"]'
+      primary_python_version:
+        description: "Version used for lint, type check and coverage upload."
+        type: string
+        required: false
+        default: "3.12"
+      source_paths:
+        description: "Space-separated paths to lint and type check."
+        type: string
+        required: false
+        default: "app tests"
+      typecheck_paths:
+        description: "Space-separated paths to type check. Usually excludes tests."
+        type: string
+        required: false
+        default: "app"
+      requirements_file:
+        type: string
+        required: false
+        default: "requirements-dev.txt"
+      runtime_requirements_file:
+        description: "Runtime-only requirements, audited for CVEs. Dev tooling is excluded because it does not ship."
+        type: string
+        required: false
+        default: "requirements.txt"
+      run_typecheck:
+        type: boolean
+        required: false
+        default: true
+      run_security:
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint and type check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.primary_python_version }}
+          cache: pip
+          cache-dependency-path: ${{ inputs.requirements_file }}
+
+      - run: pip install -r ${{ inputs.requirements_file }}
+
+      - name: ruff format
+        run: ruff format --check ${{ inputs.source_paths }}
+
+      # --output-format=github turns findings into inline pull request annotations rather
+      # than something a reviewer has to open the log to see.
+      - name: ruff check
+        run: ruff check --output-format=github ${{ inputs.source_paths }}
+
+      - name: mypy
+        if: inputs.run_typecheck
+        run: mypy ${{ inputs.typecheck_paths }}
+
+  test:
+    name: Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false # a failure on one version should not hide the result on another
+      matrix:
+        python-version: ${{ fromJSON(inputs.python_versions) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: ${{ inputs.requirements_file }}
+
+      - run: pip install -r ${{ inputs.requirements_file }}
+
+      - name: pytest
+        run: pytest
+
+      - name: Upload coverage
+        if: matrix.python-version == inputs.primary_python_version
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.xml
+          retention-days: 7
+          if-no-files-found: ignore
+
+  security:
+    name: Application security
+    if: inputs.run_security
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.primary_python_version }}
+
+      - run: pip install -r ${{ inputs.requirements_file }}
+
+      # SARIF so findings land in the Security tab next to the code, not only in a log.
+      # continue-on-error because bandit's false-positive rate on well-written code is
+      # high enough that failing the build on it would train people to skip the gate.
+      - name: bandit
+        run: bandit -r ${{ inputs.typecheck_paths }} -c pyproject.toml -f sarif -o bandit.sarif
+        continue-on-error: true
+
+      - name: Upload bandit SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: success() || failure()
+        with:
+          sarif_file: bandit.sarif
+          category: bandit
+
+      # This one DOES fail the build. A known-vulnerable dependency with an available fix
+      # is a decision, and it should be made explicitly with --ignore-vuln rather than by
+      # scrolling past a warning.
+      - name: pip-audit
+        run: pip-audit -r ${{ inputs.runtime_requirements_file }} --strict

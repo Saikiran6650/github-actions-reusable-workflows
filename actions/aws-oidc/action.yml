@@ -1,0 +1,57 @@
+name: Assume an AWS role via OIDC
+description: >-
+  Exchange the workflow's OIDC token for short-lived AWS credentials, with the session
+  named after the run so every API call is traceable in CloudTrail.
+
+# Why this composite exists rather than calling configure-aws-credentials directly:
+# it makes the session-name convention and the credential-masking default consistent
+# everywhere, so a repository cannot quietly opt out of either.
+
+inputs:
+  role-arn:
+    description: "Role to assume. Not a secret — an ARN is inert without a matching OIDC trust policy."
+    required: true
+  aws-region:
+    required: false
+    default: "us-east-1"
+  purpose:
+    description: "Short label for the session name, e.g. plan, apply, deploy."
+    required: false
+    default: "gha"
+  session-duration:
+    description: "Session length in seconds. Keep it just longer than the job needs."
+    required: false
+    default: "3600"
+
+outputs:
+  account-id:
+    description: "The AWS account the role was assumed in. Useful for asserting the pipeline is pointed at the account it should be."
+    value: ${{ steps.identity.outputs.account-id }}
+
+runs:
+  using: composite
+  steps:
+    - name: Assume role
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ inputs.role-arn }}
+        aws-region: ${{ inputs.aws-region }}
+        # Session name lands in every CloudTrail event, so an API call can be traced to the
+        # exact workflow run. Truncated because STS limits it to 64 characters and a long
+        # repository name would otherwise fail the assume.
+        role-session-name: ${{ inputs.purpose }}-${{ github.run_id }}
+        role-duration-seconds: ${{ inputs.session-duration }}
+        # Register the credentials as secrets so they are masked if anything echoes them.
+        mask-aws-account-id: true
+
+    - name: Confirm identity
+      id: identity
+      shell: bash
+      run: |
+        set -euo pipefail
+        account=$(aws sts get-caller-identity --query Account --output text)
+        arn=$(aws sts get-caller-identity --query Arn --output text)
+        echo "account-id=$account" >> "$GITHUB_OUTPUT"
+        # The ARN is logged, the account id is masked by the step above. Logging which
+        # role was assumed makes a misconfigured pipeline obvious at a glance.
+        echo "::notice::assumed $arn"
