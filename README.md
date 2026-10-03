@@ -30,6 +30,8 @@ on their next run — or on their next tag bump, if they pin conservatively.
 | [`python-quality.yml`](.github/workflows/python-quality.yml) | ruff, mypy, pytest matrix, bandit, pip-audit | no |
 | [`container-build.yml`](.github/workflows/container-build.yml) | build, Trivy, smoke test, UID assertion, SBOM, multi-arch push, cosign | no (registry uses `GITHUB_TOKEN`) |
 | [`security-scan.yml`](.github/workflows/security-scan.yml) | Checkov, Trivy config, gitleaks — all reporting SARIF | no |
+| [`terraform-policy.yml`](.github/workflows/terraform-policy.yml) | evaluates `devsecops-pipeline`'s Rego policies against a real `terraform plan`, exceptions resolved at evaluation time | yes |
+| [`image-update.yml`](.github/workflows/image-update.yml) | writes a published image digest into a GitOps repository's Kustomize overlay, direct-commit or PR mode | no (needs a `gitops_token` secret with `contents:write` on the target repo) |
 
 Composite action: [`actions/aws-oidc`](actions/aws-oidc) — assume a role with a
 CloudTrail-traceable session name and confirm the resulting identity.
@@ -99,6 +101,8 @@ fails with a 403, this table is usually the reason.
 | `python-quality.yml` | `security-events: write` |
 | `container-build.yml` | `packages: write`, `security-events: write`, `id-token: write` |
 | `security-scan.yml` | `security-events: write` |
+| `terraform-policy.yml` | `id-token: write`, `pull-requests: write` |
+| `image-update.yml` | none beyond the default (pass the `gitops_token` secret) |
 
 ## Versioning
 
@@ -174,9 +178,18 @@ every consumer at once.
 | Repository | Uses |
 |---|---|
 | `terraform-modules-library` | validate, security-scan |
-| `terraform-aws-network-foundation` | validate, plan, apply, security-scan |
-| `terraform-aws-three-tier-app` | validate, plan, apply, security-scan |
-| `sample-service` | python-quality, container-build, security-scan |
+| `terraform-aws-network-foundation` | validate, plan, policy, apply, security-scan |
+| `terraform-aws-three-tier-app` | validate, plan, policy, apply, security-scan |
+| `terraform-aws-eks-platform` | validate, plan, policy, apply, security-scan |
+| `sample-service` | python-quality, container-build, image-update, security-scan |
+| `azure-landing-zone` | security-scan |
+| `cicd-jenkins-argocd-pipeline` | security-scan |
+| `devsecops-pipeline` | security-scan |
+| `observability-stack` | security-scan |
+
+`gitops-argocd-platform` is the one repository in the portfolio with no CI workflow — it's
+ArgoCD-managed manifests, verified offline, never applied to a cluster, so there's nothing
+here for it to consume.
 
 ## License
 
