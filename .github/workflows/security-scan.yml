@@ -121,7 +121,7 @@ jobs:
       # Trivy and Checkov overlap but do not agree. Running both is cheap and each
       # regularly finds something the other misses.
       - name: Trivy config scan
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: config
           scan-ref: ${{ inputs.scan_directory }}
